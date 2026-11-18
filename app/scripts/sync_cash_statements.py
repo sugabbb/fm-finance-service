@@ -1,7 +1,7 @@
 """Nightly population of ``cash_statements``, one month at a time. Run it from cron (the service
 has no scheduler).
 
-``cash_statements`` (the bank-statement view consumed by the finance/monthly-report module) is not
+``cash_statements`` (the bank-statement view consumed by the monthly cut-off module) is not
 kept current by the cashflow/revenue/loan writes themselves; this command brings it up to date once
 a day:
 

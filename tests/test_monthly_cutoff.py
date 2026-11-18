@@ -11,18 +11,22 @@ month). Every figure of the cut-off is then checked against amounts worked out b
   manual adjustments/loan principal kept out of it (``NON_PL``), reconciling with the cash movement;
 - loans and receivables as of the month's last day;
 - snapshots: a re-run saves a new one and moves ``is_latest``; failures are recorded; dry runs
-  save nothing; an open month cannot be closed.
+  save nothing; an open month cannot be closed;
+- potential revenue: operational's month-end egg stock and fish weight estimate (stubbed, see
+  ``OperationalMonthEnd`` in conftest) valued at the month's sales prices, kept out of cash and
+  the P&L; the cut-off waits (records nothing) while operational answers 404.
 """
 
 import os
 from collections.abc import Iterator
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -36,11 +40,13 @@ from app.db.models import (
     MainCashAccount,
     MainCashAccountLog,
     MonthlyCutoff,
+    MonthlyCutoffAsset,
     MonthlyCutoffCategory,
     MonthlyCutoffLoan,
     MonthlyCutoffProfitLoss,
     MonthlyCutoffReceivable,
     OperationalCashflowBalance,
+    OperationalIntegrationOutbox,
     Revenue,
     RevenueTransferDetail,
     User,
@@ -60,9 +66,15 @@ from app.features.finance_service import (
 )
 from app.features.loan_service import add_months, cancel_loan, create_loan, repay_loan
 from app.features.main_cash_account_service import get_or_create_account
-from app.features.monthly_cutoff_service import MonthNotClosedError, run_cutoff
+from app.features.month_end_assets import MonthEndDataInvalidError, MonthEndDataNotReadyError
+from app.features.monthly_cutoff_service import MonthNotClosedError, is_closed, last_ended_period, run_cutoff
 from app.main import app
 from app.scripts.monthly_cutoff import main
+
+if TYPE_CHECKING:
+    from conftest import OperationalMonthEnd
+
+pytestmark = pytest.mark.usefixtures("operational_month_end")
 
 D = Decimal
 TODAY = today_local()
@@ -254,7 +266,19 @@ def month(db: Session, actor: User) -> dict[str, int]:
     paid_expense(db, actor, "UTILITY", "999000", TODAY, description="Next month's bill")
 
     rebuild_cash_statements(db)  # the whole history on the statement
+    deliver_outbox(db)
     return {"loan": loan.id, "lender": lender.id}
+
+
+def deliver_outbox(db: Session, at: datetime | None = None) -> None:
+    """What the outbox worker does: the egg sales reach operational, at ``at`` (default: just now,
+    i.e. before the stub finalizes the month, which it does at the time of the call)."""
+    db.execute(
+        update(OperationalIntegrationOutbox)
+        .where(OperationalIntegrationOutbox.status != "SUPERSEDED")
+        .values(status="DELIVERED", processed_at=at or datetime.now(settings.timezone) - timedelta(minutes=1))
+    )
+    db.commit()
 
 
 def cutoff_rows(db: Session) -> list[MonthlyCutoff]:
@@ -379,6 +403,25 @@ def test_a_closed_month(db: Session, month: dict[str, int]) -> None:
         "Pak Transfer": (1, zero, zero, zero, zero, zero, D("250000")),
     }, "paid sales and the rejected direct transfer are not receivables"
 
+    # Potential revenue: operational's 20 kg of UTUH eggs at the month's UTUH price (Bu Sri's and
+    # Pak Transfer's sales, 25,000/kg; the rejected one does not count). Not cash, not in the P&L:
+    # every figure above is the same as without it.
+    assert (cutoff.potential_revenue, cutoff.potential_revenue_eggs, cutoff.potential_revenue_fish) == (
+        D("500000"),
+        D("500000"),
+        zero,
+    )
+    assets = [
+        (item.asset_type, item.item_code, item.weight_kg, item.price_per_kg, item.price_month, item.price_sales, item.value)
+        for item in details(db, MonthlyCutoffAsset, cutoff.id)
+    ]
+    assert assets == [
+        ("EGG_STOCK", "UTUH", D("20.000"), D("25000.000"), MONTH.start, 2, D("500000")),
+        ("EGG_STOCK", "PECAH", D("0.000"), None, None, 0, zero),
+        ("EGG_STOCK", "REJECT", D("0.000"), None, None, 0, zero),
+    ], "nothing to value, nothing to warn about"
+    assert set(cutoff.month_end_sources) == {"egg_stock", "fish_weight_estimate"}
+
 
 def test_cash_is_not_counted_twice(db: Session, month: dict[str, int]) -> None:
     """The main account and the cash on hand are pockets of the same money: their balances are
@@ -490,6 +533,208 @@ def test_only_a_closed_month_can_be_cut_off(db: Session, monkeypatch: pytest.Mon
         run_cutoff(session=db)
 
 
+# --- Potential revenue --------------------------------------------------------------------------
+
+
+def sale(
+    db: Session, actor: User, revenue_type: str, sold_on: date, details: object, *, rejected: bool = False
+) -> Revenue:
+    row = save_revenue(
+        db,
+        {
+            "revenue_type": revenue_type,
+            "transaction_date": sold_on,
+            "payment_method": "DIRECT_TRANSFER" if rejected else "CASH",
+            "direct_transfer_date": sold_on if rejected else None,
+            "customer_id": None,
+            "new_customer": {"name": "Pasar Induk", "phone": "0813", "customer_type": "AGEN", "notes": None},
+            "details": details,
+        },
+        actor,
+    )
+    if rejected:
+        decide_revenue(db, row, actor, "REJECTED", "Not received", False)
+    db.commit()
+    return row
+
+
+def eggs(category: str, kg: str, price: str) -> list[dict[str, object]]:
+    return [{"egg_category": category, "weight_kg": D(kg), "quantity_pieces": 1, "price_per_kg_idr": D(price)}]
+
+
+def fish(kg: str, price: str) -> dict[str, object]:
+    return {"weight_kg": D(kg), "price_per_kg_idr": D(price), "notes": None}
+
+
+def test_potential_revenue_values_the_month_end_stock_at_sales_prices(
+    db: Session, actor: User, month: dict[str, int], operational_month_end: OperationalMonthEnd
+) -> None:
+    """Every price worked out by hand from the sales below (UTUH also has the fixture's two
+    25,000/kg sales of 10 kg in the month)."""
+    sale(db, actor, "EGG_SALE", day(12), eggs("UTUH", "5", "28000"))
+    sale(db, actor, "EGG_SALE", day(13), eggs("UTUH", "50", "10000"), rejected=True)  # does not count
+    sale(db, actor, "EGG_SALE", TODAY, eggs("UTUH", "50", "90000"))  # after the month: does not count
+    # No PECAH sale in the month: priced from the latest earlier month that has one, within the lookback.
+    sale(db, actor, "EGG_SALE", OLDER.start + timedelta(days=3), eggs("PECAH", "4", "15000"))
+    old = Period.month_of(MONTH.start - timedelta(days=130))  # 4+ months back: out of the lookback
+    sale(db, actor, "EGG_SALE", old.start, eggs("PECAH", "4", "99000"))
+    sale(db, actor, "EGG_SALE", old.start, eggs("REJECT", "4", "5000"))  # so REJECT stays unpriced
+    sale(db, actor, "FISH_SALE", day(14), fish("100", "22000"))
+    sale(db, actor, "FISH_SALE", day(15), fish("50", "23500"))
+    operational_month_end.egg_lines = [
+        {"egg_category": "REJECT", "weight_kg": "1.000", "quantity_pieces": 18},
+        {"egg_category": "UTUH", "weight_kg": "20.000", "quantity_pieces": 320},
+        {"egg_category": "PECAH", "weight_kg": "2.500", "quantity_pieces": 45},
+    ]
+    operational_month_end.ponds = [
+        {"pond_id": 7, "pond_code": "K-02", "pond_name": "Kolam 2", "estimated_weight_kg": "300.500",
+         "estimated_fish_count": 2400, "average_weight_g": "125.2"},  # a field finance does not use
+        {"pond_id": 3, "pond_code": "K-01", "pond_name": "Kolam 1", "estimated_weight_kg": "0.000"},
+    ]
+    operational_month_end.revision = 2
+    operational_month_end.finalized_at = (MONTH.ends_at + timedelta(hours=9)).isoformat()
+    deliver_outbox(db, at=MONTH.ends_at + timedelta(hours=1))  # before operational finalized
+
+    outcome = run_cutoff(period=MONTH, session=db)
+
+    (cutoff,) = cutoff_rows(db)
+    rows = [
+        (
+            item.asset_type, item.item_code, item.item_name, item.source_id, item.quantity_pieces, item.weight_kg,
+            item.price_per_kg, item.price_month, item.price_sales, item.value,
+        )
+        for item in details(db, MonthlyCutoffAsset, cutoff.id)
+    ]
+    assert rows == [
+        # (10 x 25,000 + 10 x 25,000 + 5 x 28,000) / 25 kg = 25,600/kg; x 20 kg
+        ("EGG_STOCK", "UTUH", "UTUH", None, 320, D("20.000"), D("25600.000"), MONTH.start, 3, D("512000")),
+        # OLDER's 15,000/kg; x 2.5 kg
+        ("EGG_STOCK", "PECAH", "PECAH", None, 45, D("2.500"), D("15000.000"), OLDER.start, 1, D("37500")),
+        ("EGG_STOCK", "REJECT", "REJECT", None, 18, D("1.000"), None, None, 0, D("0")),
+        ("FISH_STOCK", "K-01", "Kolam 1", 3, None, D("0.000"), D("22500.000"), MONTH.start, 2, D("0")),
+        # (100 x 22,000 + 50 x 23,500) / 150 kg = 22,500/kg; x 300.5 kg
+        ("FISH_STOCK", "K-02", "Kolam 2", 7, 2400, D("300.500"), D("22500.000"), MONTH.start, 2, D("6761250")),
+    ]
+    assert (cutoff.potential_revenue_eggs, cutoff.potential_revenue_fish, cutoff.potential_revenue) == (
+        D("549500"),
+        D("6761250"),
+        D("7310750"),
+    )
+    first = Period.month_of(MONTH.start - timedelta(days=85))  # the lookback: 3 months before MONTH
+    assert cutoff.warnings == [
+        f"no REJECT egg sale from {first.label} to {MONTH.label} to price it: 1.000 kg of month-end stock is not valued"
+    ]
+    assert cutoff.month_end_sources == {
+        "egg_stock": {"revision": 2, "finalized_at": operational_month_end.finalized_at},
+        "fish_weight_estimate": {"revision": 2, "finalized_at": operational_month_end.finalized_at},
+    }
+    assert outcome.figures.potential_revenue.total() == D("7310750")
+    # Not cash, not income: the unpaid sales above and the stock change nothing there.
+    assert (cutoff.cash_closing, cutoff.revenue, cutoff.net_profit) == (D("5416000"), D("175000"), D("-211500"))
+    assert operational_month_end.calls == [
+        ("egg-stock", MONTH.start.year, MONTH.start.month),
+        ("fish-weight-estimate", MONTH.start.year, MONTH.start.month),
+    ]
+
+
+def test_the_cut_off_waits_for_operationals_month_end_data(
+    db: Session, month: dict[str, int], operational_month_end: OperationalMonthEnd
+) -> None:
+    """Operational answers 404 until it has finalized the month: nothing is synced or recorded."""
+    operational_month_end.missing = {"egg-stock", "fish-weight-estimate"}
+    syncs = db.scalar(select(func.count()).select_from(CashStatementSyncRun))
+
+    with pytest.raises(MonthEndDataNotReadyError) as waiting:
+        run_cutoff(period=MONTH, session=db)
+
+    assert [item.path for item in waiting.value.missing] == [
+        f"/api/v1/internal/month-end/{MONTH.start.year}/{MONTH.start.month}/egg-stock",
+        f"/api/v1/internal/month-end/{MONTH.start.year}/{MONTH.start.month}/fish-weight-estimate",
+    ], "both are asked, so everything still missing is named"
+    assert cutoff_rows(db) == []
+    assert db.scalar(select(func.count()).select_from(CashStatementSyncRun)) == syncs
+    assert not is_closed(MONTH, session=db)
+    with pytest.raises(MonthEndDataNotReadyError):
+        run_cutoff(period=MONTH, dry_run=True, session=db)
+
+    operational_month_end.missing = {"fish-weight-estimate"}  # one is not enough
+    with pytest.raises(MonthEndDataNotReadyError):
+        run_cutoff(period=MONTH, session=db)
+    assert cutoff_rows(db) == []
+
+    operational_month_end.missing = set()
+    run_cutoff(period=MONTH, session=db)
+    assert [row.status for row in cutoff_rows(db)] == ["SUCCESS"]
+    assert is_closed(MONTH, session=db)
+
+
+@pytest.mark.parametrize(
+    ("dataset", "fields", "error"),
+    [
+        ("egg-stock", {"month": 1 if MONTH.start.month != 1 else 2}, "returned for"),
+        ("egg-stock", {"lines": [{"egg_category": "UTUH", "weight_kg": "-1", "quantity_pieces": 0}]}, "weight_kg"),
+        ("egg-stock", {"lines": [{"egg_category": "JUMBO", "weight_kg": "1", "quantity_pieces": 1}]}, "egg_category"),
+        ("egg-stock", {"lines": [{"egg_category": "UTUH", "weight_kg": "1.0001", "quantity_pieces": 1}]}, "weight_kg"),
+        (
+            "egg-stock",
+            {"lines": [{"egg_category": "UTUH", "weight_kg": "1", "quantity_pieces": 1}] * 2},
+            "more than once",
+        ),
+        ("egg-stock", {"finalized_at": "2026-08-01T08:00:00"}, "finalized_at"),
+        ("egg-stock", {"revision": None}, "revision"),
+        ("fish-weight-estimate", {"ponds": [{"pond_id": 1, "pond_code": "K-01", "pond_name": "Kolam"}]}, "estimated_weight_kg"),
+        (
+            "fish-weight-estimate",
+            {"ponds": [{"pond_id": 1, "pond_code": "K-01", "pond_name": "K", "estimated_weight_kg": "1"}] * 2},
+            "more than once",
+        ),
+    ],
+)
+def test_invalid_operational_data_is_never_used(
+    db: Session, operational_month_end: OperationalMonthEnd, dataset: str, fields: dict, error: str
+) -> None:
+    operational_month_end.overrides[dataset] = fields
+
+    with pytest.raises(MonthEndDataInvalidError, match=error):
+        run_cutoff(period=MONTH, session=db)
+
+    assert cutoff_rows(db) == []
+
+
+def test_egg_sales_operational_had_not_received_are_warned_about(
+    db: Session, actor: User, month: dict[str, int], operational_month_end: OperationalMonthEnd
+) -> None:
+    """The stock is only right if operational had every egg sale of the month when it finalized."""
+    finalized = MONTH.ends_at + timedelta(hours=9)
+    operational_month_end.finalized_at = finalized.isoformat()
+    db.execute(update(OperationalIntegrationOutbox).values(processed_at=finalized - timedelta(hours=1)))
+    late = sale(db, actor, "EGG_SALE", day(20), eggs("UTUH", "1", "25000"))  # still in the outbox
+    sale(db, actor, "EGG_SALE", TODAY, eggs("UTUH", "1", "25000"))  # after the month: irrelevant
+    delivered_late = db.scalar(select(Revenue).where(Revenue.transaction_date == MONTH.end - timedelta(days=45)))
+    db.execute(
+        update(OperationalIntegrationOutbox)
+        .where(OperationalIntegrationOutbox.aggregate_id == delivered_late.id)
+        .values(processed_at=finalized + timedelta(minutes=5))
+    )
+    db.commit()
+    assert db.scalar(select(OperationalIntegrationOutbox.status).where(OperationalIntegrationOutbox.aggregate_id == late.id)) == "PENDING"
+
+    run_cutoff(period=MONTH, session=db)
+
+    assert cutoff_rows(db)[0].warnings == [
+        f"2 egg sale(s) dated up to {MONTH.end.isoformat()} had not reached operational-service when it "
+        "finalized the egg stock: the stock (and its potential revenue) may not reflect them"
+    ]
+
+
+def test_the_last_ended_month() -> None:
+    assert last_ended_period(CURRENT.starts_at) == MONTH, "00:00 on the 1st"
+    assert last_ended_period(CURRENT.starts_at + timedelta(days=9, hours=13)) == MONTH
+    assert last_ended_period(CURRENT.starts_at - timedelta(seconds=1)) == OLDER, "23:59:59 on the last day"
+    # The month is the local (APP_TIMEZONE) one, whatever the timezone of the time given.
+    assert last_ended_period((CURRENT.starts_at + timedelta(minutes=30)).astimezone(UTC)) == MONTH
+
+
 # --- Command ------------------------------------------------------------------------------------
 
 
@@ -509,11 +754,58 @@ def test_cli(db: Session, month: dict[str, int], caplog: pytest.LogCaptureFixtur
     assert f"{prefix}: revenue 175000, net profit -211500" in caplog.text
     assert f"{prefix}: 1 loans owed, principal outstanding 2530000" in caplog.text
     assert f"{prefix}: receivables 650000 from 4 customers" in caplog.text
+    assert f"{prefix}: potential revenue 500000 (eggs 500000, fish 0)" in caplog.text
 
     assert main(["--month", CURRENT.label]) == 2, "the month has not ended"
     with pytest.raises(SystemExit) as error:
         main(["--month", "2026-13"])
     assert error.value.code == 2
+
+
+def test_cli_pending_waits_for_operational_then_closes_once(
+    db: Session,
+    month: dict[str, int],
+    operational_month_end: OperationalMonthEnd,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hourly ``--pending`` cron: exit 3 while operational has not finalized the last ended
+    month, then closes it, then does nothing."""
+    caplog.set_level("INFO", logger="app.scripts.monthly_cutoff")
+    monkeypatch.setattr("app.scripts.monthly_cutoff.now_utc", lambda: CURRENT.starts_at + timedelta(days=2, hours=5))
+    operational_month_end.missing = {"egg-stock"}
+
+    assert main(["--pending"]) == 3
+    assert cutoff_rows(db) == []
+    assert (
+        f"monthly cut-off {MONTH.label}: not closed, waiting for operational-service month-end data (2 day(s) "
+        f"after the month's end): /api/v1/internal/month-end/{MONTH.start.year}/{MONTH.start.month}/egg-stock "
+        f"-> 404 MONTH_END_NOT_FINALIZED The month-end data of {MONTH.label} has not been finalized yet."
+    ) in caplog.text
+    assert main(["--month", MONTH.label]) == 3, "an explicit month waits too"
+
+    operational_month_end.missing = set()
+    assert main(["--pending"]) == 0
+    (cutoff,) = cutoff_rows(db)
+    assert (cutoff.period_start, cutoff.is_latest) == (MONTH.start, True)
+    caplog.clear()
+
+    assert main(["--pending"]) == 0
+    assert f"monthly cut-off {MONTH.label}: already closed; nothing to close" in caplog.text
+    assert len(cutoff_rows(db)) == 1, "no second snapshot"
+    assert main(["--pending", "--month", OLDER.label]) == 0, "--month picks another month to close if still open"
+    assert [row.period_start for row in cutoff_rows(db)] == [MONTH.start, OLDER.start]
+
+
+def test_cli_operational_failure(
+    db: Session, month: dict[str, int], operational_month_end: OperationalMonthEnd, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unreachable or invalid: a failure (exit 1), not a wait; nothing is recorded."""
+    operational_month_end.overrides["fish-weight-estimate"] = {"ponds": "not a list"}
+
+    assert main(["--month", MONTH.label]) == 1
+    assert "monthly cut-off failed" in caplog.text
+    assert cutoff_rows(db) == []
 
 
 # --- API ----------------------------------------------------------------------------------------
@@ -632,6 +924,30 @@ def test_api_returns_the_months_close(db: Session, month: dict[str, int], client
         "amount": "5000000",
     }
 
+    potential = body["potential_revenue"]
+    assert (potential["valuation"], potential["total"]) == ("AVERAGE_SALES_PRICE", "500000")
+    assert {key: value for key, value in potential["eggs"].items() if key not in ("items", "source")} == {
+        "value": "500000",
+        "weight_kg": "20.000",
+        "quantity_pieces": 320,
+    }
+    assert potential["eggs"]["items"][0] == {
+        "egg_category": "UTUH",
+        "weight_kg": "20.000",
+        "quantity_pieces": 320,
+        "price": {"price_per_kg": "25000.000", "month": MONTH.label, "sales": 2},
+        "value": "500000",
+    }
+    assert potential["eggs"]["items"][1]["price"] is None, "PECAH: nothing sold, nothing in stock"
+    assert potential["eggs"]["source"] == cutoff.month_end_sources["egg_stock"]
+    assert potential["fish"] == {
+        "value": "0",
+        "weight_kg": "0.000",
+        "fish_count": 0,
+        "source": cutoff.month_end_sources["fish_weight_estimate"],
+        "ponds": [],
+    }
+
 
 def test_api_returns_the_latest_close_of_the_month(
     db: Session, actor: User, month: dict[str, int], client: TestClient
@@ -646,6 +962,51 @@ def test_api_returns_the_latest_close_of_the_month(
 
     assert (body["id"], body["revision"]) == (restated.cutoff_id, 2)
     assert body["receivables"]["outstanding"] == "400000"
+
+
+def test_api_potential_revenue_of_ponds(
+    db: Session, actor: User, month: dict[str, int], client: TestClient, operational_month_end: OperationalMonthEnd
+) -> None:
+    sale(db, actor, "FISH_SALE", day(14), fish("10", "20000"))
+    deliver_outbox(db)
+    operational_month_end.ponds = [
+        {"pond_id": 3, "pond_code": "K-01", "pond_name": "Kolam 1", "estimated_weight_kg": "12.345",
+         "estimated_fish_count": 90},
+        {"pond_id": 4, "pond_code": "K-02", "pond_name": "Kolam 2", "estimated_weight_kg": "1.000"},
+    ]
+    run_cutoff(period=MONTH, session=db)
+
+    fish_out = client.get(URL, params=month_params()).json()["data"]["potential_revenue"]["fish"]
+
+    assert {key: value for key, value in fish_out.items() if key not in ("ponds", "source")} == {
+        "value": "266900",  # 12.345 x 20,000 = 246,900 + 1 x 20,000
+        "weight_kg": "13.345",
+        "fish_count": None,  # not given for every pond
+    }
+    assert fish_out["ponds"][0] == {
+        "pond": {"id": 3, "code": "K-01", "name": "Kolam 1"},
+        "weight_kg": "12.345",
+        "fish_count": 90,
+        "price": {"price_per_kg": "20000.000", "month": MONTH.label, "sales": 1},
+        "value": "246900",
+    }
+
+
+def test_api_snapshot_taken_before_potential_revenue(db: Session, month: dict[str, int], client: TestClient) -> None:
+    """Snapshots taken before the cut-off included it have no potential revenue (not a false 0)."""
+    run_cutoff(period=MONTH, session=db)
+    db.execute(
+        update(MonthlyCutoff).values(
+            potential_revenue=None, potential_revenue_eggs=None, potential_revenue_fish=None, month_end_sources=None
+        )
+    )
+    db.execute(MonthlyCutoffAsset.__table__.delete())
+    db.commit()
+
+    body = client.get(URL, params=month_params()).json()["data"]
+
+    assert body["potential_revenue"] is None
+    assert body["cash"]["closing"] == "5416000"
 
 
 def test_api_month_not_closed(

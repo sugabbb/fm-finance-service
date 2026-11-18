@@ -129,6 +129,7 @@ def wipe_cashflow_data(db: Session) -> None:
         MainCashAccountEvent,
         MainCashAccountLog,
         MonthlyCutoff,
+        MonthlyCutoffJob,
         OperationalCashflow,
         OperationalCashflowBalance,
         OperationalCashflowPayment,
@@ -154,6 +155,7 @@ def wipe_cashflow_data(db: Session) -> None:
             )
         )
     )
+    db.execute(delete(MonthlyCutoffJob))
     db.execute(delete(MonthlyCutoff))  # details cascade
     db.execute(delete(CashStatement))
     db.execute(delete(CashStatementSyncRun))
@@ -214,3 +216,78 @@ def actor(db: Session) -> User:
     db.commit()
     db.refresh(user)
     return user
+
+
+# --- operational-service month-end data (egg stock, fish weight estimate) ------------------------
+
+
+class OperationalMonthEnd:
+    """Stands in for operational-service's month-end API (docs/operational-month-end-api.md).
+
+    Answers for whatever month is asked with the lines below; a dataset named in ``missing``
+    answers 404 (not finalized yet). ``finalized_at`` defaults to the time of the call."""
+
+    EGG_PATH = "/api/v1/internal/month-end/{year}/{month}/egg-stock"
+    FISH_PATH = "/api/v1/internal/month-end/{year}/{month}/fish-weight-estimate"
+
+    def __init__(self) -> None:
+        self.egg_lines: list[dict[str, object]] = [
+            {"egg_category": "UTUH", "weight_kg": "20.000", "quantity_pieces": 320},
+            {"egg_category": "PECAH", "weight_kg": "0.000", "quantity_pieces": 0},
+            {"egg_category": "REJECT", "weight_kg": "0.000", "quantity_pieces": 0},
+        ]
+        self.ponds: list[dict[str, object]] = []
+        self.missing: set[str] = set()  # "egg-stock", "fish-weight-estimate"
+        self.revision = 1
+        self.finalized_at: str | None = None
+        self.overrides: dict[str, dict[str, object]] = {}  # dataset -> fields replacing the defaults
+        self.calls: list[tuple[str, int, int]] = []
+
+    def _answer(self, dataset: str, path: str, year: int, month: int, body: dict[str, object]) -> dict[str, object]:
+        from app.features.common import now_utc
+        from app.integrations.operational import OperationalNotFound
+
+        self.calls.append((dataset, year, month))
+        if dataset in self.missing:
+            raise OperationalNotFound(
+                path.format(year=year, month=month),
+                "MONTH_END_NOT_FINALIZED",
+                f"The month-end data of {year}-{month:02d} has not been finalized yet.",
+            )
+        return {
+            "year": year,
+            "month": month,
+            "revision": self.revision,
+            "finalized_at": self.finalized_at or now_utc().isoformat(),
+            **body,
+            **self.overrides.get(dataset, {}),
+        }
+
+    def egg_stock(self, year: int, month: int) -> dict[str, object]:
+        return self._answer("egg-stock", self.EGG_PATH, year, month, {"lines": self.egg_lines})
+
+    def fish_weight_estimate(self, year: int, month: int) -> dict[str, object]:
+        return self._answer("fish-weight-estimate", self.FISH_PATH, year, month, {"ponds": self.ponds})
+
+
+@pytest.fixture
+def operational_month_end(monkeypatch: pytest.MonkeyPatch) -> OperationalMonthEnd:
+    stub = OperationalMonthEnd()
+    client = "app.integrations.operational.operational_client"
+    monkeypatch.setattr(f"{client}.month_end_egg_stock", stub.egg_stock)
+    monkeypatch.setattr(f"{client}.month_end_fish_weight_estimate", stub.fish_weight_estimate)
+    return stub
+
+
+@pytest.fixture(autouse=True)
+def export_storage_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
+    """Excel exports go to a temporary directory, never to the working directory, and never to a
+    Cloud Storage bucket configured in the environment or .env (tests that want one use a fake)."""
+    from pathlib import Path
+
+    from app.core.config import settings
+
+    directory: Path = tmp_path_factory.mktemp("exports")
+    monkeypatch.setattr(settings, "export_storage_backend", "local")
+    monkeypatch.setattr(settings, "export_storage_dir", str(directory))
+    yield directory

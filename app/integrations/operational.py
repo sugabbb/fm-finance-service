@@ -6,8 +6,20 @@ from app.core.config import settings
 from app.core.errors import AppError
 
 
+class OperationalNotFound(Exception):
+    """Operational answered ``404`` to a read that allows it (``allow_not_found``)."""
+
+    def __init__(self, path: str, code: str | None, detail: str | None) -> None:
+        super().__init__(f"{path}: 404 {code or '-'} {detail or ''}".rstrip())
+        self.path = path
+        self.code = code
+        self.detail = detail
+
+
 class OperationalClient:
-    def _request(self, method: str, path: str, *, json: object | None = None) -> dict[str, Any]:
+    def _request(
+        self, method: str, path: str, *, json: object | None = None, allow_not_found: bool = False
+    ) -> dict[str, Any]:
         try:
             response = httpx.request(
                 method,
@@ -21,6 +33,14 @@ class OperationalClient:
         if response.status_code in (401, 403) and path == "/api/v1/internal/auth/authorize":
             body = response.json()
             raise AppError(response.status_code, body.get("code", "INVALID_TOKEN"), body.get("detail", "Access denied."))
+        if response.status_code == 404 and allow_not_found:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                body = {}
+            raise OperationalNotFound(path, body.get("code"), body.get("detail"))
         if response.is_error:
             raise AppError(
                 502,
@@ -43,6 +63,22 @@ class OperationalClient:
 
     def employee(self, employee_id: int) -> dict[str, Any]:
         return self._request("GET", f"/api/v1/internal/references/employees/{employee_id}")["data"]
+
+    def month_end_egg_stock(self, year: int, month: int) -> dict[str, Any]:
+        """The closing egg stock of a month. Raises :class:`OperationalNotFound` while operational
+        has not finalized the month (see docs/operational-month-end-api.md)."""
+        return self._month_end(year, month, "egg-stock")
+
+    def month_end_fish_weight_estimate(self, year: int, month: int) -> dict[str, Any]:
+        """The month-end fish weight estimate per pond; :class:`OperationalNotFound` while not finalized."""
+        return self._month_end(year, month, "fish-weight-estimate")
+
+    def _month_end(self, year: int, month: int, resource: str) -> dict[str, Any]:
+        body = self._request("GET", f"/api/v1/internal/month-end/{year}/{month}/{resource}", allow_not_found=True)
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise AppError(502, "OPERATIONAL_SERVICE_ERROR", f"Operational service returned no data for {resource}.")
+        return data
 
     def put_inventory(self, path: str, payload: dict[str, Any]) -> None:
         self._request("PUT", path, json=payload)

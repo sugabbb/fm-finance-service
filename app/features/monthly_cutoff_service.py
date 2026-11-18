@@ -29,6 +29,12 @@ Receivables
 Categories
     The month's statement rows grouped by direction, source table and category.
 
+Potential revenue (``app.features.month_end_assets``)
+    The egg stock and fish weight estimate at the month's end, from operational-service's private
+    API, valued at the month's average sales price per kg. The cut-off **waits for them**: while
+    operational answers ``404`` for the month (not finalized yet), nothing is computed or recorded
+    (:class:`MonthEndDataNotReadyError`) and the month stays open; the next run tries again.
+
 **No double counting.** The business has one pool of money in several pockets (main cash account,
 operational cash on hand, sales cash not deposited yet). Moves between pockets (top-ups, transfers)
 are not on the statement, so the statement's credits/debits *are* the business's cash movements:
@@ -43,7 +49,9 @@ are not on the statement, so the statement's credits/debits *are* the business's
 - collections of receivables are the statement's credit rows of each sale, not ``revenue_payments``
   counted again;
 - manual main account adjustments (opening balance, loan proceeds, ...) are cash but cannot be
-  classified as income or expense, so they are listed as ``NON_PL`` lines, not in the P&L.
+  classified as income or expense, so they are listed as ``NON_PL`` lines, not in the P&L;
+- potential revenue is neither cash nor income: it is reported on its own, never added to
+  ``cash_closing``, revenue or net profit.
 
 The P&L therefore reconciles with the cash movement:
 ``net_profit - loan principal + manual in - manual out = cash_in - cash_out`` (checked every run).
@@ -61,19 +69,21 @@ import logging
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import Integer, case, cast, func, literal, select, update
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models import (
     CashStatement,
     Customer,
     FinancialOpeningBalance,
     Loan,
     MonthlyCutoff,
+    MonthlyCutoffAsset,
     MonthlyCutoffCategory,
     MonthlyCutoffLoan,
     MonthlyCutoffProfitLoss,
@@ -95,6 +105,14 @@ from app.features.common import now_utc
 from app.features.loan_service import CANCELLED, active_repayments, allocate, loan_query
 from app.features.locks import lock_balances
 from app.features.main_cash_account_service import CREDIT, DEBIT, TRANSFER_TYPE
+from app.features.month_end_assets import (
+    EGG_STOCK,
+    FISH_STOCK,
+    MonthEndAssets,
+    PotentialRevenue,
+    fetch_month_end_assets,
+    value_assets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +241,7 @@ class CutoffFigures:
     profit_loss: ProfitLoss
     loans: list[LoanPosition]
     receivables: list[CustomerReceivable]
+    potential_revenue: PotentialRevenue
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -466,11 +485,13 @@ def check_consistency(figures: CutoffFigures) -> None:
         )
 
 
-def compute_cutoff(db: Session, period: Period) -> CutoffFigures:
-    """Every figure of the cut-off of ``period`` (read only)."""
+def compute_cutoff(db: Session, period: Period, assets: MonthEndAssets) -> CutoffFigures:
+    """Every figure of the cut-off of ``period`` (read only), ``assets`` being the month-end
+    operational data fetched beforehand."""
     warnings: list[str] = []
     categories = category_totals(db, period)
     loans = loan_positions(db, period)
+    potential_revenue = value_assets(db, period, assets)
     figures = CutoffFigures(
         period=period,
         cash=cash_position(db, period),
@@ -478,9 +499,11 @@ def compute_cutoff(db: Session, period: Period) -> CutoffFigures:
         profit_loss=profit_and_loss(categories, loans, warnings),
         loans=loans,
         receivables=customer_receivables(db, period),
+        potential_revenue=potential_revenue,
         warnings=warnings,
     )
     check_consistency(figures)
+    figures.warnings.extend(potential_revenue.warnings)
     return figures
 
 
@@ -506,6 +529,11 @@ def save_figures(db: Session, cutoff: MonthlyCutoff, figures: CutoffFigures) -> 
     cutoff.receivable_invoices = sum((item.invoices for item in figures.receivables), 0)
     cutoff.receivables = sum((item.outstanding for item in figures.receivables), ZERO)
     cutoff.receivables_pending_verification = sum((item.pending_verification for item in figures.receivables), ZERO)
+    potential = figures.potential_revenue
+    cutoff.potential_revenue = potential.total()
+    cutoff.potential_revenue_eggs = potential.total(EGG_STOCK)
+    cutoff.potential_revenue_fish = potential.total(FISH_STOCK)
+    cutoff.month_end_sources = dict(potential.sources)
     db.flush()
     db.add_all(
         MonthlyCutoffCategory(
@@ -562,6 +590,23 @@ def save_figures(db: Session, cutoff: MonthlyCutoff, figures: CutoffFigures) -> 
         )
         for item in figures.receivables
     )
+    db.add_all(
+        MonthlyCutoffAsset(
+            cutoff_id=cutoff.id,
+            position=position,
+            asset_type=item.asset_type,
+            item_code=item.item_code,
+            item_name=item.item_name,
+            source_id=item.source_id,
+            quantity_pieces=item.quantity_pieces,
+            weight_kg=item.weight_kg,
+            price_per_kg=item.price.price_per_kg if item.price else None,
+            price_month=item.price.month.start if item.price else None,
+            price_sales=item.price.sales if item.price else 0,
+            value=item.value,
+        )
+        for position, item in enumerate(potential.lines, start=1)
+    )
 
 
 def mark_latest(db: Session, cutoff: MonthlyCutoff) -> None:
@@ -609,20 +654,44 @@ def cutoff_period(started_at: datetime, period: Period | None = None) -> Period:
     return period
 
 
+def last_ended_period(at: datetime) -> Period:
+    """The latest month that has ended at ``at`` (the month before the current one, in
+    ``APP_TIMEZONE``): what a run retrying until the month is closed works on."""
+    return Period.month_of(Period.month_of(at.astimezone(settings.timezone).date()).start - timedelta(days=1))
+
+
+def is_closed(period: Period, session: Session | None = None) -> bool:
+    """Whether ``period`` has a reported (successful) cut-off."""
+    with _session(session) as db:
+        return bool(
+            db.scalar(
+                select(MonthlyCutoff.id).where(
+                    MonthlyCutoff.period_start == period.start, MonthlyCutoff.is_latest.is_(True)
+                )
+            )
+        )
+
+
 def run_cutoff(*, period: Period | None = None, dry_run: bool = False, session: Session | None = None) -> CutoffOutcome:
-    """Closes a month: syncs its cash statement, computes the figures and saves them as a new
-    snapshot marked ``is_latest``, recording a failed run too (then re-raises its error).
+    """Closes a month: fetches its month-end operational data, syncs its cash statement, computes
+    the figures and saves them as a new snapshot marked ``is_latest``, recording a failed run too
+    (then re-raises its error).
+
+    The operational data is fetched first, before anything is recorded or synced: while it is not
+    available (``MonthEndDataNotReadyError``) the month simply stays open, and an operational
+    failure (unreachable, invalid data) fails the run before it starts.
 
     A dry run computes and returns the figures without saving anything; the month's cash
     statement sync still runs (and is recorded) for real, as it would on any night."""
     started_at = now_utc()
     period = cutoff_period(started_at, period)
+    assets = fetch_month_end_assets(period)
     with _session(session) as db:
         if dry_run:
             sync = run_sync(period=period, session=db)
             try:
                 lock_balances(db)  # a consistent picture: money writes wait for the read
-                return CutoffOutcome(None, sync.run_id, compute_cutoff(db, period), True)
+                return CutoffOutcome(None, sync.run_id, compute_cutoff(db, period, assets), True)
             finally:
                 db.rollback()
 
@@ -635,7 +704,7 @@ def run_cutoff(*, period: Period | None = None, dry_run: bool = False, session: 
         try:
             sync_run_id = run_sync(period=period, session=db).run_id
             lock_balances(db)
-            figures = compute_cutoff(db, period)
+            figures = compute_cutoff(db, period, assets)
             cutoff.sync_run_id = sync_run_id
             save_figures(db, cutoff, figures)
             mark_latest(db, cutoff)

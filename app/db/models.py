@@ -800,6 +800,15 @@ class MonthlyCutoff(Base):
     receivables: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
     receivables_pending_verification: Mapped[Decimal] = mapped_column(Numeric(18, 0), default=Decimal("0"))
 
+    # Potential revenue at period_end (see month_end_assets): the month-end egg stock and fish
+    # weight estimate from operational-service, valued at the month's sales prices. Not cash and
+    # not in the P&L. NULL on snapshots taken before it was part of the cut-off.
+    potential_revenue: Mapped[Decimal | None] = mapped_column(Numeric(18, 0))
+    potential_revenue_eggs: Mapped[Decimal | None] = mapped_column(Numeric(18, 0))
+    potential_revenue_fish: Mapped[Decimal | None] = mapped_column(Numeric(18, 0))
+    # The operational data used, per dataset: {"egg_stock": {"revision", "finalized_at"}, ...}.
+    month_end_sources: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
 
 class MonthlyCutoffCategory(Base):
     """The month's statement rows grouped by direction, source and category."""
@@ -884,6 +893,125 @@ class MonthlyCutoffReceivable(Base):
     # Direct-transfer sales still waiting for approval: paid according to the customer, not
     # verified yet. Not part of ``outstanding`` or its aging.
     pending_verification: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+
+
+class MonthlyCutoffAsset(Base):
+    """One line of the month's potential revenue: the stock of an egg category, or the estimated
+    fish weight of a pond, at period_end (operational-service data, copied), and its value at the
+    sales price it was priced with. A line without a price (no sale to price it from) is worth 0.
+    """
+
+    __tablename__ = "monthly_cutoff_assets"
+    __table_args__ = (
+        CheckConstraint("asset_type IN ('EGG_STOCK','FISH_STOCK')", name="asset_type"),
+        CheckConstraint("weight_kg >= 0 AND value >= 0", name="amounts"),
+        CheckConstraint(
+            "(price_per_kg IS NULL) = (price_month IS NULL) AND (price_per_kg IS NULL OR price_sales > 0)",
+            name="price",
+        ),
+        UniqueConstraint("cutoff_id", "asset_type", "item_code"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    cutoff_id: Mapped[int] = mapped_column(ForeignKey("monthly_cutoffs.id", ondelete="CASCADE"))
+    position: Mapped[int] = mapped_column(Integer)
+    asset_type: Mapped[str] = mapped_column(String(20))
+    # Egg category (UTUH, PECAH, REJECT) or pond code; the name is the pond name for fish.
+    item_code: Mapped[str] = mapped_column(String(60))
+    item_name: Mapped[str] = mapped_column(String(255))
+    # Operational pond id (no foreign key: another service's data); NULL for eggs.
+    source_id: Mapped[int | None] = mapped_column(BigInteger)
+    # Eggs in stock, or the estimated number of fish (NULL when operational does not give it).
+    quantity_pieces: Mapped[int | None] = mapped_column(BigInteger)
+    weight_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3))
+    # Average sales price per kg and the month of the sales it comes from; NULL: not priced.
+    price_per_kg: Mapped[Decimal | None] = mapped_column(Numeric(18, 3))
+    price_month: Mapped[date | None] = mapped_column(Date)
+    price_sales: Mapped[int] = mapped_column(Integer, default=0)
+    value: Mapped[Decimal] = mapped_column(Numeric(18, 0))
+
+
+class MonthlyCutoffExport(Base):
+    """The Excel workbook of a cut-off (app.features.monthly_cutoff_export): its generation and
+    where the file is stored. One per cut-off, created by its first generation attempt.
+
+    ``status`` is the last attempt's: ``GENERATING`` (running, or interrupted if it has been
+    running longer than EXPORT_GENERATION_TIMEOUT_MINUTES), ``SUCCEEDED`` or ``FAILED`` (with
+    ``last_error``). ``failed_attempts`` counts the failures in a row, automatic and manual; the
+    automatic retries stop at EXPORT_MAX_AUTOMATIC_ATTEMPTS. The file columns describe the last
+    successful generation (NULL until there is one): a failed regeneration keeps the earlier file.
+    The file is built from the snapshot and the month's cash statement rows at generation time;
+    ``warnings`` lists what did not match the snapshot (e.g. the statement changed after the close).
+    """
+
+    __tablename__ = "monthly_cutoff_exports"
+    __table_args__ = (
+        CheckConstraint("status IN ('GENERATING','SUCCEEDED','FAILED')", name="status"),
+        CheckConstraint("failed_attempts >= 0", name="failed_attempts"),
+        CheckConstraint(
+            "(storage_key IS NULL) = (generated_at IS NULL)"
+            " AND (storage_key IS NULL) = (size_bytes IS NULL)"
+            " AND (size_bytes IS NULL OR size_bytes > 0)",
+            name="file",
+        ),
+        CheckConstraint("status <> 'SUCCEEDED' OR storage_key IS NOT NULL", name="succeeded"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    cutoff_id: Mapped[int] = mapped_column(ForeignKey("monthly_cutoffs.id", ondelete="CASCADE"), unique=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    attempt_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    attempt_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Who asked for the last attempt from the frontend; NULL: an automatic attempt.
+    attempt_requested_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    # The last successful generation.
+    storage_backend: Mapped[str | None] = mapped_column(String(20))
+    storage_key: Mapped[str | None] = mapped_column(String(500))
+    file_name: Mapped[str | None] = mapped_column(String(255))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    warnings: Mapped[list[str]] = mapped_column(JSONB, default=list)
+
+
+class MonthlyCutoffJob(Base):
+    """A monthly cut-off or Excel export to run in the background (app.features.monthly_cutoff_jobs).
+
+    ``CUTOFF`` creates (or recreates) a month's cut-off, then generates its Excel export; ``EXPORT``
+    generates the export of the month's reported cut-off. Queued from the frontend (``QUEUED``, run
+    by the worker) or started by the hourly cron (``requested_by`` NULL). ``FAILED`` jobs say why
+    (``reason_code``: OPERATIONAL_DATA_NOT_READY, INTERRUPTED, ALREADY_RUNNING, ERROR).
+    At most one job of a type is queued or running per month.
+    """
+
+    __tablename__ = "monthly_cutoff_jobs"
+    __table_args__ = (
+        CheckConstraint("job_type IN ('CUTOFF','EXPORT')", name="job_type"),
+        CheckConstraint("status IN ('QUEUED','RUNNING','SUCCEEDED','FAILED')", name="status"),
+        CheckConstraint("(status = 'FAILED') = (reason_code IS NOT NULL)", name="reason"),
+        Index(
+            "uq_monthly_cutoff_jobs_active",
+            "job_type",
+            "period_start",
+            unique=True,
+            postgresql_where=text("status IN ('QUEUED','RUNNING')"),
+        ),
+        Index("ix_monthly_cutoff_jobs_queue", "status", "requested_at"),
+        Index("ix_monthly_cutoff_jobs_period", "period_start", "job_type", "requested_at"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(10))
+    period_start: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(20))
+    # The user who asked from the frontend; NULL: the hourly cron (automatic).
+    requested_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reason_code: Mapped[str | None] = mapped_column(String(40))
+    reason: Mapped[str | None] = mapped_column(Text)
+    # The cut-off created (CUTOFF) or exported (EXPORT).
+    cutoff_id: Mapped[int | None] = mapped_column(ForeignKey("monthly_cutoffs.id", ondelete="SET NULL"))
 
 
 class OperationalIntegrationOutbox(TimestampMixin, Base):

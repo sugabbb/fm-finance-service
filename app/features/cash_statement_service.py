@@ -60,7 +60,7 @@ so the API does not wait for it. Two entry points populate it:
   every transaction ever recorded, after ``alembic upgrade head`` or to repair drift.
 
 Both take the same advisory lock as the writes, so they are safe while the API is live, and both
-are idempotent. The finance/monthly-report module that reads this table tolerates the statement
+are idempotent. The monthly cut-off module that reads this table tolerates the statement
 being up to a day behind the source transactions.
 """
 

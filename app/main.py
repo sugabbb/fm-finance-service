@@ -14,7 +14,17 @@ from sqlalchemy.exc import IntegrityError
 from app.core.config import settings
 from app.core.errors import AppError
 from app.db.session import SessionLocal
-from app.features import cash_statements, customers, finance, lenders, loans, main_cash_account, monthly_cutoffs
+from app.features import (
+    cash_statements,
+    customers,
+    finance,
+    lenders,
+    loans,
+    main_cash_account,
+    monthly_cutoff_export,
+    monthly_cutoff_jobs,
+    monthly_cutoffs,
+)
 from app.features import settings as settings_feature
 
 logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -23,6 +33,7 @@ logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings.validate_runtime_secrets()
+    settings.validate_export_storage()
     yield
 
 
@@ -84,7 +95,8 @@ def health_ready() -> dict[str, str]:
 
 for feature_router in (
     customers.router, settings_feature.router, finance.router, main_cash_account.router,
-    cash_statements.router, lenders.router, loans.router, monthly_cutoffs.router,
+    cash_statements.router, lenders.router, loans.router, monthly_cutoffs.router, monthly_cutoff_export.router,
+    monthly_cutoff_jobs.router,
 ):
     app.include_router(feature_router, prefix="/api/v1")
 
